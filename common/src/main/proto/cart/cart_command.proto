@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package pb.cart;
+
+import "cart/cart_common.proto";
+
+option go_package = "github.com/MamangRust/monolith-ecommerce-shared/pb";
+
+message CreateCartRequest {
+    int32 quantity = 1;
+    string product_id = 2;
+    string user_id = 3;
+}
+
+message DeleteAllCartRequest {
+  string user_id = 1;
+  repeated string cart_ids = 2;
+}
+
+message DeleteCartRequest {
+  string cart_id = 1;
+  string user_id = 2;
+}
+
+service CartCommandService {
+    rpc Create(CreateCartRequest) returns(ApiResponseCart);
+    rpc Delete(DeleteCartRequest) returns(ApiResponseCartDelete);
+    rpc DeleteAll(DeleteAllCartRequest) returns(ApiResponseCartAll);
+}

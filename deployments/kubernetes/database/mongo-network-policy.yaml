@@ -1,0 +1,177 @@
+# NetworkPolicies for the six MongoDB instances. Each policy allows ingress on
+# port 27017 ONLY from the pods of the services that own that bounded context
+# (playbook §1.1) plus that context's mongodb-exporter. No egress rules: mongod
+# only answers inbound connections.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-identity
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-identity
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: auth
+        - podSelector:
+            matchLabels:
+              app: role
+        - podSelector:
+            matchLabels:
+              app: user
+        - podSelector:
+            matchLabels:
+              app: mongodb-exporter-identity
+      ports:
+        - protocol: TCP
+          port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-merchant
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-merchant
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: merchant
+        - podSelector:
+            matchLabels:
+              app: merchant-award
+        - podSelector:
+            matchLabels:
+              app: merchant-business
+        - podSelector:
+            matchLabels:
+              app: merchant-detail
+        - podSelector:
+            matchLabels:
+              app: merchant-policy
+        - podSelector:
+            matchLabels:
+              app: mongodb-exporter-merchant
+      ports:
+        - protocol: TCP
+          port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-catalog
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-catalog
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: category
+        - podSelector:
+            matchLabels:
+              app: product
+        - podSelector:
+            matchLabels:
+              app: mongodb-exporter-catalog
+      ports:
+        - protocol: TCP
+          port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-sales
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-sales
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: order
+        - podSelector:
+            matchLabels:
+              app: order-item
+        - podSelector:
+            matchLabels:
+              app: transaction
+        - podSelector:
+            matchLabels:
+              app: mongodb-exporter-sales
+      ports:
+        - protocol: TCP
+          port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-experience
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-experience
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: banner
+        - podSelector:
+            matchLabels:
+              app: cart
+        - podSelector:
+            matchLabels:
+              app: review
+        - podSelector:
+            matchLabels:
+              app: review-detail
+        - podSelector:
+            matchLabels:
+              app: shipping-address
+        - podSelector:
+            matchLabels:
+              app: slider
+        - podSelector:
+            matchLabels:
+              app: mongodb-exporter-experience
+      ports:
+        - protocol: TCP
+          port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-email
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-email
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: email
+        - podSelector:
+            matchLabels:
+              app: mongodb-exporter-email
+      ports:
+        - protocol: TCP
+          port: 27017

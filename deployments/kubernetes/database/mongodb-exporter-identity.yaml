@@ -1,0 +1,51 @@
+# MongoDB metrics exporter for the identity context (Prometheus scrapes :9216).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-exporter-identity
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb-exporter-identity
+  template:
+    metadata:
+      labels:
+        app: mongodb-exporter-identity
+        tier: mongodb-exporter
+    spec:
+      containers:
+        - name: mongodb-exporter
+          image: percona/mongodb_exporter:0.42
+          imagePullPolicy: IfNotPresent
+          args: ["--mongodb.uri=mongodb://mongo-identity.ecommerce.svc.cluster.local:27017"]
+          ports:
+            - name: metrics
+              containerPort: 9216
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9216
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-exporter-identity
+  namespace: ecommerce
+spec:
+  selector:
+    app: mongodb-exporter-identity
+  ports:
+    - name: metrics
+      port: 9216
+      targetPort: 9216

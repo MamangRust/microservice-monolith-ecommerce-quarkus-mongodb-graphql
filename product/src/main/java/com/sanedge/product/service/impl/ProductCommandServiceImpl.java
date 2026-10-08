@@ -1,0 +1,332 @@
+package com.sanedge.product.service.impl;
+
+import java.time.Instant;
+import java.util.Set;
+
+import org.bson.types.ObjectId;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.sanedge.common.adapter.category.CategoryPort;
+import com.sanedge.common.adapter.merchant.MerchantPort;
+import com.sanedge.common.config.RedisService;
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.exception.InvalidRequestException;
+import com.sanedge.common.observability.TracingMetrics;
+import com.sanedge.product.domain.requests.CreateProductRequest;
+import com.sanedge.product.domain.requests.UpdateProductRequest;
+import com.sanedge.product.domain.response.ProductResponse;
+import com.sanedge.product.domain.response.ProductResponseDeleteAt;
+import com.sanedge.product.entity.Product;
+import com.sanedge.product.repository.ProductCommandRepository;
+import com.sanedge.product.repository.ProductQueryRepository;
+import com.sanedge.product.service.ProductCommandService;
+
+import io.opentelemetry.api.common.Attributes;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.ConstraintViolationException;
+import jakarta.validation.Validator;
+
+@ApplicationScoped
+public class ProductCommandServiceImpl implements ProductCommandService {
+    private static final Logger logger = LoggerFactory.getLogger(ProductCommandServiceImpl.class);
+
+    private final ProductCommandRepository productCommandRepository;
+    private final ProductQueryRepository productQueryRepository;
+    private final MerchantPort merchantPort;
+    private final CategoryPort categoryPort;
+    private final Validator validator;
+    private final RedisService redisService;
+    private final TracingMetrics tracingMetrics;
+
+    @Inject
+    public ProductCommandServiceImpl(ProductCommandRepository productCommandRepository,
+            ProductQueryRepository productQueryRepository,
+            MerchantPort merchantPort,
+            CategoryPort categoryPort,
+            Validator validator,
+            RedisService redisService,
+            TracingMetrics tracingMetrics) {
+        this.productCommandRepository = productCommandRepository;
+        this.productQueryRepository = productQueryRepository;
+        this.merchantPort = merchantPort;
+        this.categoryPort = categoryPort;
+        this.validator = validator;
+        this.redisService = redisService;
+        this.tracingMetrics = tracingMetrics;
+    }
+
+    private <T> void validateRequest(T req) {
+        Set<ConstraintViolation<T>> violations = validator.validate(req);
+        if (!violations.isEmpty()) {
+            StringBuilder sb = new StringBuilder();
+            for (ConstraintViolation<T> violation : violations) {
+                sb.append(violation.getPropertyPath()).append(": ").append(violation.getMessage()).append("; ");
+            }
+            logger.error("Validation failed: {}", sb);
+            throw new ConstraintViolationException("Validation failed: " + sb, violations);
+        }
+    }
+
+    private Uni<Void> invalidateCache(String productId) {
+        if (productId != null) {
+            return redisService.deleteReactive("product:id:" + productId).replaceWithVoid();
+        }
+        return Uni.createFrom().voidItem();
+    }
+
+    @Override
+    public Uni<ApiResponse<ProductResponse>> createProduct(CreateProductRequest req) {
+        logger.info("Creating product: {}", req.getName());
+
+        try {
+            validateRequest(req);
+        } catch (Exception e) {
+            logger.error("Validation failed for create product", e);
+            return Uni.createFrom().failure(e);
+        }
+
+        Product product = new Product();
+        product.setMerchantId(new ObjectId(req.getMerchantId()));
+        product.setCategoryId(new ObjectId(req.getCategoryId()));
+        product.setName(req.getName());
+        product.setDescription(req.getDescription());
+        product.setPrice(req.getPrice());
+        product.setCountInStock(req.getCountInStock());
+        product.setBrand(req.getBrand());
+        product.setWeight(req.getWeight());
+        product.setRating(req.getRating().floatValue());
+        product.setSlugProduct(req.getSlugProduct());
+        product.setImageProduct(req.getImageProduct());
+        Instant now = Instant.now();
+        product.setCreatedAt(now);
+        product.setUpdatedAt(now);
+
+        return tracingMetrics.traceAndMeasure("createProduct", "create_product",
+                Attributes.builder().put("product.name", req.getName()).build(),
+                () -> categoryPort.findById(req.getCategoryId())
+                        .chain(category -> productCommandRepository.persist(product)
+                                .chain(saved -> {
+                                    ProductResponse response = ProductResponse.from(saved);
+
+                                    return invalidateCache(saved.id != null ? saved.id.toHexString() : null)
+                                            .map(v -> {
+                                                logger.info("Successfully created product with ID: {}", saved.id);
+                                                return ApiResponse.success("Product created successfully", response);
+                                            });
+                                }))
+                        .onFailure().invoke(e -> logger.error("Failed to create product: {}", req.getName(), e)));
+    }
+
+    @Override
+    public Uni<ApiResponse<ProductResponse>> updateProduct(UpdateProductRequest req) {
+        logger.info("Updating product ID: {}", req.getProductId());
+
+        try {
+            validateRequest(req);
+        } catch (Exception e) {
+            logger.error("Validation failed for update product", e);
+            return Uni.createFrom().failure(e);
+        }
+
+        return tracingMetrics.traceAndMeasure("updateProduct", "update_product",
+                Attributes.builder().put("product.id", String.valueOf(req.getProductId())).build(),
+                () -> merchantPort.findById(req.getMerchantId())
+                        .chain(merchant -> categoryPort.findById(req.getCategoryId()))
+                        .chain(category -> productQueryRepository.findProductById(req.getProductId()))
+                        .chain(optProduct -> {
+                            if (optProduct.isEmpty()) {
+                                throw new ResourceNotFoundException("Product not found");
+                            }
+                            Product product = optProduct.get();
+
+                            if (req.getImageProduct() != null) {
+                                product.setImageProduct(req.getImageProduct());
+                            }
+
+                            product.setMerchantId(new ObjectId(req.getMerchantId()));
+                            product.setCategoryId(new ObjectId(req.getCategoryId()));
+                            product.setName(req.getName());
+                            product.setDescription(req.getDescription());
+                            product.setPrice(req.getPrice());
+                            product.setCountInStock(req.getCountInStock());
+                            product.setBrand(req.getBrand());
+                            product.setWeight(req.getWeight());
+                            product.setRating(req.getRating().floatValue());
+                            product.setSlugProduct(req.getSlugProduct());
+                            product.setUpdatedAt(Instant.now());
+
+                            return productCommandRepository.update(product);
+                        })
+                        .chain(updated -> {
+                            ProductResponse response = ProductResponse.from(updated);
+
+                            return invalidateCache(updated.id != null ? updated.id.toHexString() : null)
+                                    .map(v -> {
+                                        logger.info("Successfully updated product with ID: {}", updated.id);
+                                        return ApiResponse.success("Product updated successfully", response);
+                                    });
+                        })
+                        .onFailure()
+                        .invoke(e -> logger.error("Failed to update product ID: {}", req.getProductId(), e)));
+    }
+
+    @Override
+    public Uni<ApiResponse<ProductResponseDeleteAt>> trashedProduct(String productId) {
+        logger.info("Trashing product ID: {}", productId);
+
+        return tracingMetrics.traceAndMeasure("trashProduct", "trash_product",
+                Attributes.builder().put("product.id", String.valueOf(productId)).build(),
+                () -> productCommandRepository.trashed(productId)
+                        .chain(product -> {
+                            if (product == null) {
+                                logger.warn("Failed to trash product - not found or already trashed with ID: {}",
+                                        productId);
+                                throw new ResourceNotFoundException("Product not found or already trashed");
+                            }
+                            ProductResponseDeleteAt response = ProductResponseDeleteAt.from(product);
+
+                            return invalidateCache(productId)
+                                    .map(v -> {
+                                        logger.info("Successfully trashed product with ID: {}", productId);
+                                        return ApiResponse.success("Product trashed successfully", response);
+                                    });
+                        })
+                        .onFailure().invoke(e -> logger.error("Failed to trash product ID: {}", productId, e)));
+    }
+
+    @Override
+    public Uni<ApiResponse<ProductResponseDeleteAt>> restoreProduct(String productId) {
+        logger.info("Restoring product ID: {}", productId);
+
+        return tracingMetrics.traceAndMeasure("restoreProduct", "restore_product",
+                Attributes.builder().put("product.id", String.valueOf(productId)).build(),
+                () -> productCommandRepository.restore(productId)
+                        .chain(product -> {
+                            if (product == null) {
+                                logger.warn("Failed to restore product - not found or not trashed with ID: {}",
+                                        productId);
+                                throw new ResourceNotFoundException("Product not found or not trashed");
+                            }
+                            ProductResponseDeleteAt response = ProductResponseDeleteAt.from(product);
+
+                            return invalidateCache(productId)
+                                    .map(v -> {
+                                        logger.info("Successfully restored product with ID: {}", productId);
+                                        return ApiResponse.success("Product restored successfully", response);
+                                    });
+                        })
+                        .onFailure().invoke(e -> logger.error("Failed to restore product ID: {}", productId, e)));
+    }
+
+    @Override
+    public Uni<ApiResponse<ProductResponse>> adjustStock(String productId, Integer delta) {
+        if (productId == null || productId.isBlank() || delta == null || delta == 0) {
+            return Uni.createFrom().failure(new InvalidRequestException("Product id and non-zero stock delta are required"));
+        }
+
+        return tracingMetrics.traceAndMeasure("adjustProductStock", "adjust_product_stock",
+                Attributes.builder().put("product.id", String.valueOf(productId))
+                        .put("product.stock_delta", delta)
+                        .build(),
+                () -> productCommandRepository.adjustStock(productId, delta)
+                        .chain(updated -> {
+                            if (updated == null) {
+                                throw new ResourceNotFoundException(
+                                        "Product not found or insufficient stock for product id=" + productId);
+                            }
+                            return invalidateCache(updated.id != null ? updated.id.toHexString() : null)
+                                    .map(v -> ApiResponse.success("Product stock adjusted successfully",
+                                            ProductResponse.from(updated)));
+                        }));
+    }
+
+    @Override
+    public Uni<ApiResponse<ProductResponse>> updateProductCountStock(String productId, Integer stock) {
+        logger.info("Updating product stock ID: {}, stock: {}", productId, stock);
+
+        return tracingMetrics.traceAndMeasure("updateProductCountStock", "update_product_count_stock",
+                Attributes.builder().put("product.id", String.valueOf(productId)).build(),
+                () -> productQueryRepository.findProductById(productId)
+                        .chain(optProduct -> {
+                            if (optProduct.isEmpty()) {
+                                throw new ResourceNotFoundException("Product not found");
+                            }
+                            Product product = optProduct.get();
+                            product.setCountInStock(stock);
+                            product.setUpdatedAt(Instant.now());
+
+                            return productCommandRepository.update(product);
+                        })
+                        .chain(updated -> {
+                            ProductResponse response = ProductResponse.from(updated);
+
+                            return invalidateCache(updated.id != null ? updated.id.toHexString() : null)
+                                    .map(v -> {
+                                        logger.info("Successfully updated product stock with ID: {}", updated.id);
+                                        return ApiResponse.success("Product stock updated successfully", response);
+                                    });
+                        })
+                        .onFailure().invoke(e -> logger.error("Failed to update product stock ID: {}", productId, e)));
+    }
+
+    @Override
+    public Uni<ApiResponse<Void>> deleteProductPermanent(String productId) {
+        Attributes attrs = Attributes.builder().put("product.id", String.valueOf(productId)).build();
+        logger.warn("Permanently deleting product ID: {}", productId);
+
+        return tracingMetrics.traceAndMeasure("deleteProductPermanent", "delete_product_permanent", attrs, () -> {
+            return productCommandRepository.deletePermanent(productId)
+                    .chain(deletedProduct -> {
+                        if (deletedProduct == null) {
+                            logger.warn("Permanent delete failed - product not found or must be trashed before permanent deletion with id: {}",
+                                    productId);
+                            throw new InvalidRequestException(
+                                    "Product not found or must be trashed before permanent deletion");
+                        }
+
+                        return invalidateCache(productId)
+                                .map(v2 -> {
+                                    logger.info("Successfully permanently deleted product with ID: {}", productId);
+                                    return ApiResponse.success("Product permanently deleted");
+                                });
+                    });
+        });
+    }
+
+    @Override
+    public Uni<ApiResponse<Void>> restoreAllProducts() {
+        logger.info("Restoring ALL trashed products");
+
+        return tracingMetrics.traceAndMeasure("restoreAllProducts", "restore_all_products", () -> {
+            return productCommandRepository.restoreAllDeleted()
+                    .map(success -> {
+                        if (!success) {
+                            throw new ResourceNotFoundException("No trashed products found");
+                        }
+                        logger.info("Successfully restored all trashed products");
+                        return ApiResponse.success("All products restored successfully");
+                    });
+        });
+    }
+
+    @Override
+    public Uni<ApiResponse<Void>> deleteAllProductsPermanent() {
+        logger.warn("Permanently deleting ALL trashed products");
+
+        return tracingMetrics.traceAndMeasure("deleteAllProductsPermanent", "delete_all_products_permanent", () -> {
+            return productCommandRepository.deleteAllDeleted()
+                    .map(success -> {
+                        if (!success) {
+                            throw new ResourceNotFoundException("No trashed products found");
+                        }
+                        logger.info("Successfully permanently deleted all trashed products");
+                        return ApiResponse.success("All products permanently deleted");
+                    });
+        });
+    }
+}

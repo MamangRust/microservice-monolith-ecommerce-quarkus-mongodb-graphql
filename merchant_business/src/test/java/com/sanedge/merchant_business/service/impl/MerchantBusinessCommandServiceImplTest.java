@@ -1,0 +1,392 @@
+package com.sanedge.merchant_business.service.impl;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.time.Instant;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.function.Supplier;
+
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.ConstraintViolationException;
+import jakarta.validation.Validator;
+
+import org.bson.types.ObjectId;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import com.sanedge.common.config.RedisService;
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.exception.InvalidRequestException;
+import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
+import com.sanedge.merchant_business.domain.requests.CreateMerchantBusinessRequest;
+import com.sanedge.merchant_business.domain.requests.UpdateMerchantBusinessRequest;
+import com.sanedge.merchant_business.domain.response.MerchantBusinessResponse;
+import com.sanedge.merchant_business.domain.response.MerchantBusinessResponseDeleteAt;
+import com.sanedge.merchant_business.entity.MerchantBusinessInformation;
+import com.sanedge.merchant_business.repository.MerchantBusinessCommandRepository;
+import com.sanedge.merchant_business.repository.MerchantBusinessQueryRepository;
+
+import com.sanedge.common.adapter.merchant.MerchantPort;
+import com.sanedge.common.adapter.model.Merchant;
+
+import io.opentelemetry.api.common.Attributes;
+import io.smallrye.mutiny.Uni;
+
+@ExtendWith(MockitoExtension.class)
+class MerchantBusinessCommandServiceImplTest {
+
+    private static final String ID_1 = "507f1f77bcf86cd799439011";
+    private static final String ID_999 = "507f1f77bcf86cd799439099";
+    private static final String MERCHANT_ID = "507f1f77bcf86cd799439021";
+
+    @Mock
+    private MerchantBusinessCommandRepository merchantBusinessCommandRepository;
+
+    @Mock
+    private MerchantBusinessQueryRepository merchantBusinessQueryRepository;
+
+    @Mock
+    private Validator validator;
+
+    @Mock
+    private RedisService redisService;
+
+    @Mock
+    private TracingMetrics tracingMetrics;
+
+    @Mock
+    private MerchantPort merchantPort;
+
+    private MerchantBusinessCommandServiceImpl service;
+
+    @BeforeEach
+    void setUp() {
+        service = new MerchantBusinessCommandServiceImpl(
+                merchantBusinessCommandRepository,
+                merchantBusinessQueryRepository,
+                validator,
+                redisService,
+                tracingMetrics,
+                merchantPort);
+
+        lenient().when(validator.validate(any())).thenReturn(new HashSet<>());
+
+        lenient().when(redisService.deleteReactive(anyString()))
+                .thenReturn(Uni.createFrom().voidItem());
+
+        lenient().doAnswer(invocation -> {
+            Supplier<Uni<?>> supplier = invocation.getArgument(3);
+            return supplier.get();
+        }).when(tracingMetrics)
+                .traceAndMeasure(anyString(), anyString(), any(Attributes.class), any(Supplier.class));
+
+        lenient().doAnswer(invocation -> {
+            Supplier<Uni<?>> supplier = invocation.getArgument(2);
+            return supplier.get();
+        }).when(tracingMetrics)
+                .traceAndMeasure(anyString(), anyString(), any(Supplier.class));
+
+        lenient().when(merchantBusinessCommandRepository.restoreAllDeleted())
+                .thenReturn(Uni.createFrom().item(true));
+        lenient().when(merchantBusinessCommandRepository.deleteAllDeleted())
+                .thenReturn(Uni.createFrom().item(true));
+    }
+
+    private MerchantBusinessInformation createTestEntity(String id, String merchantId, String taxId) {
+        MerchantBusinessInformation info = new MerchantBusinessInformation();
+        info.id = new ObjectId(id);
+        info.setMerchantId(new ObjectId(merchantId));
+        info.setBusinessType("Retail");
+        info.setTaxId(taxId);
+        info.setEstablishedYear(2020);
+        info.setNumberOfEmployees(50);
+        info.setWebsiteUrl("https://example.com");
+        info.setCreatedAt(Instant.now());
+        info.setUpdatedAt(Instant.now());
+        return info;
+    }
+
+    private CreateMerchantBusinessRequest createValidCreateRequest() {
+        CreateMerchantBusinessRequest req = new CreateMerchantBusinessRequest();
+        req.setMerchantId(MERCHANT_ID);
+        req.setBusinessType("Retail");
+        req.setTaxId("TAX-001");
+        req.setEstablishedYear(2020);
+        req.setNumberOfEmployees(50);
+        req.setWebsiteUrl("https://example.com");
+        return req;
+    }
+
+    private UpdateMerchantBusinessRequest createValidUpdateRequest() {
+        UpdateMerchantBusinessRequest req = new UpdateMerchantBusinessRequest();
+        req.setMerchantBusinessInfoId(ID_1); // set meskipun @Null, karena validasi dimock
+        req.setBusinessType("Wholesale");
+        req.setTaxId("TAX-002");
+        req.setEstablishedYear(2021);
+        req.setNumberOfEmployees(100);
+        req.setWebsiteUrl("https://example.org");
+        return req;
+    }
+
+    private void mockMerchantExists(String merchantId) {
+        when(merchantPort.findById(anyString()))
+                .thenReturn(Uni.createFrom().item(new Merchant(merchantId, null, "Merchant", null, null,
+                        null, null, null, Instant.now(), Instant.now())));
+    }
+
+    private void mockMerchantNotFound() {
+        when(merchantPort.findById(anyString()))
+                .thenReturn(Uni.createFrom().failure(
+                        new ResourceNotFoundException("Merchant not found with id " + MERCHANT_ID)));
+    }
+
+    @Nested
+    @DisplayName("create merchant business tests")
+    class CreateTests {
+
+        @Test
+        @DisplayName("should successfully create business info")
+        void create_Success() {
+            CreateMerchantBusinessRequest req = createValidCreateRequest();
+            mockMerchantExists(req.getMerchantId());
+
+            when(merchantBusinessCommandRepository.persist(any(MerchantBusinessInformation.class)))
+                    .thenAnswer(inv -> {
+                        MerchantBusinessInformation b = inv.getArgument(0);
+                        b.id = new ObjectId(ID_1); // id diset oleh DB
+                        return Uni.createFrom().item(b);
+                    });
+
+            ApiResponse<MerchantBusinessResponse> response = service.createMerchantBusiness(req)
+                    .await().indefinitely();
+
+            assertThat(response.status()).isEqualTo("success");
+            assertThat(response.message()).isEqualTo("Merchant business info created successfully");
+            assertThat(response.data().getId()).isEqualTo(ID_1);
+            verify(redisService).deleteReactive("merchantbusiness:id:" + ID_1);
+        }
+
+        @Test
+        @DisplayName("should fail when merchant not found")
+        void create_MerchantNotFound() {
+            CreateMerchantBusinessRequest req = createValidCreateRequest();
+            mockMerchantNotFound();
+
+            assertThatThrownBy(() -> service.createMerchantBusiness(req).await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("Merchant not found with id " + req.getMerchantId());
+        }
+
+        @Test
+        @DisplayName("should throw ConstraintViolationException when validation fails")
+        void create_ValidationFailure() {
+            CreateMerchantBusinessRequest req = new CreateMerchantBusinessRequest();
+            Set<ConstraintViolation<CreateMerchantBusinessRequest>> violations = new HashSet<>();
+
+            @SuppressWarnings("unchecked")
+            ConstraintViolation<CreateMerchantBusinessRequest> mockViolation = org.mockito.Mockito
+                    .mock(ConstraintViolation.class);
+            jakarta.validation.Path mockPath = org.mockito.Mockito.mock(jakarta.validation.Path.class);
+
+            lenient().when(mockViolation.getPropertyPath()).thenReturn(mockPath);
+            lenient().when(mockViolation.getMessage()).thenReturn("must not be blank");
+            violations.add(mockViolation);
+
+            when(validator.validate(any(CreateMerchantBusinessRequest.class))).thenReturn(violations);
+
+            assertThatThrownBy(() -> service.createMerchantBusiness(req).await().indefinitely())
+                    .isInstanceOf(ConstraintViolationException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("update merchant business tests")
+    class UpdateTests {
+
+        @Test
+        @DisplayName("should successfully update business info")
+        void update_Success() {
+            UpdateMerchantBusinessRequest req = createValidUpdateRequest();
+            MerchantBusinessInformation existing = createTestEntity(ID_1, MERCHANT_ID, "TAX-OLD");
+
+            when(merchantBusinessQueryRepository.findMerchantBusinessInformationById(ID_1))
+                    .thenReturn(Uni.createFrom().item(existing));
+            when(merchantBusinessCommandRepository.update(any(MerchantBusinessInformation.class)))
+                    .thenAnswer(inv -> {
+                        MerchantBusinessInformation b = inv.getArgument(0);
+                        return Uni.createFrom().item(b);
+                    });
+
+            ApiResponse<MerchantBusinessResponse> response = service.updateMerchantBusiness(req)
+                    .await().indefinitely();
+
+            assertThat(response.status()).isEqualTo("success");
+            assertThat(response.message()).isEqualTo("Merchant business info updated successfully");
+            assertThat(response.data().getTaxId()).isEqualTo("TAX-002");
+            verify(redisService).deleteReactive("merchantbusiness:id:" + ID_1);
+        }
+
+        @Test
+        @DisplayName("should fail when business info not found")
+        void update_NotFound() {
+            UpdateMerchantBusinessRequest req = createValidUpdateRequest();
+            when(merchantBusinessQueryRepository.findMerchantBusinessInformationById(ID_1))
+                    .thenReturn(Uni.createFrom().nullItem());
+
+            assertThatThrownBy(() -> service.updateMerchantBusiness(req).await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("Merchant business info not found with id " + ID_1);
+        }
+
+        @Test
+        @DisplayName("should fail when merchantBusinessInfoId is null")
+        void update_NullId() {
+            UpdateMerchantBusinessRequest req = new UpdateMerchantBusinessRequest(); // id null
+            assertThatThrownBy(() -> service.updateMerchantBusiness(req).await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("MerchantBusinessInfoId is required");
+        }
+    }
+
+    @Nested
+    @DisplayName("trash merchant business tests")
+    class TrashTests {
+
+        @Test
+        @DisplayName("should successfully trash business info")
+        void trash_Success() {
+            MerchantBusinessInformation info = createTestEntity(ID_1, MERCHANT_ID, "TAX-TRASH");
+            when(merchantBusinessCommandRepository.trashed(ID_1)).thenReturn(Uni.createFrom().item(info));
+
+            ApiResponse<MerchantBusinessResponseDeleteAt> response = service.trashedMerchantBusiness(ID_1)
+                    .await().indefinitely();
+
+            assertThat(response.status()).isEqualTo("success");
+            assertThat(response.message()).isEqualTo("Merchant business info trashed successfully");
+            assertThat(response.data().getId()).isEqualTo(ID_1);
+            verify(redisService).deleteReactive("merchantbusiness:id:" + ID_1);
+        }
+
+        @Test
+        @DisplayName("should fail when business info not found")
+        void trash_NotFound() {
+            when(merchantBusinessCommandRepository.trashed(ID_999)).thenReturn(Uni.createFrom().nullItem());
+            assertThatThrownBy(() -> service.trashedMerchantBusiness(ID_999).await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("Merchant business info not found or already trashed");
+        }
+    }
+
+    @Nested
+    @DisplayName("restore merchant business tests")
+    class RestoreTests {
+
+        @Test
+        @DisplayName("should successfully restore business info")
+        void restore_Success() {
+            MerchantBusinessInformation info = createTestEntity(ID_1, MERCHANT_ID, "TAX-RESTORE");
+            when(merchantBusinessCommandRepository.restore(ID_1)).thenReturn(Uni.createFrom().item(info));
+
+            ApiResponse<MerchantBusinessResponseDeleteAt> response = service.restoreMerchantBusiness(ID_1)
+                    .await().indefinitely();
+
+            assertThat(response.status()).isEqualTo("success");
+            assertThat(response.message()).isEqualTo("Merchant business info restored successfully");
+            verify(redisService).deleteReactive("merchantbusiness:id:" + ID_1);
+        }
+
+        @Test
+        @DisplayName("should fail when business info is not trashed")
+        void restore_NotTrashed() {
+            when(merchantBusinessCommandRepository.restore(ID_1)).thenReturn(Uni.createFrom().nullItem());
+            assertThatThrownBy(() -> service.restoreMerchantBusiness(ID_1).await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("Merchant business info not found or not trashed");
+        }
+    }
+
+    @Nested
+    @DisplayName("delete permanent merchant business tests")
+    class DeletePermanentTests {
+
+        @Test
+        @DisplayName("should permanently delete business info")
+        void deletePermanent_Success() {
+            MerchantBusinessInformation info = createTestEntity(ID_1, MERCHANT_ID, "TAX-DEL");
+            info.setDeletedAt(Instant.now());
+            when(merchantBusinessCommandRepository.deletePermanent(ID_1)).thenReturn(Uni.createFrom().item(info));
+
+            ApiResponse<Void> response = service.deleteMerchantBusinessPermanent(ID_1).await().indefinitely();
+            assertThat(response.status()).isEqualTo("success");
+            assertThat(response.message()).isEqualTo("Merchant business info permanently deleted");
+            verify(redisService).deleteReactive("merchantbusiness:id:" + ID_1);
+        }
+
+        @Test
+        @DisplayName("should fail when business info not found or not trashed")
+        void deletePermanent_NotFound() {
+            when(merchantBusinessCommandRepository.deletePermanent(ID_999)).thenReturn(Uni.createFrom().nullItem());
+            assertThatThrownBy(() -> service.deleteMerchantBusinessPermanent(ID_999).await().indefinitely())
+                    .isInstanceOf(InvalidRequestException.class)
+                    .hasMessageContaining(
+                            "Merchant business info not found or must be trashed before permanent deletion");
+        }
+    }
+
+    @Nested
+    @DisplayName("restore all merchant business tests")
+    class RestoreAllTests {
+
+        @Test
+        @DisplayName("should restore all trashed business info")
+        void restoreAll_Success() {
+            ApiResponse<Void> response = service.restoreAllMerchantBusiness().await().indefinitely();
+            assertThat(response.status()).isEqualTo("success");
+            assertThat(response.message()).isEqualTo("All trashed merchant business info restored");
+        }
+
+        @Test
+        @DisplayName("should fail when no trashed business info")
+        void restoreAll_NoTrashed() {
+            when(merchantBusinessCommandRepository.restoreAllDeleted()).thenReturn(Uni.createFrom().item(false));
+            assertThatThrownBy(() -> service.restoreAllMerchantBusiness().await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("No trashed merchant business info found");
+        }
+    }
+
+    @Nested
+    @DisplayName("delete all permanent merchant business tests")
+    class DeleteAllTests {
+
+        @Test
+        @DisplayName("should delete all trashed business info")
+        void deleteAll_Success() {
+            ApiResponse<Void> response = service.deleteAllMerchantBusinessPermanent().await().indefinitely();
+            assertThat(response.status()).isEqualTo("success");
+            assertThat(response.message()).isEqualTo("All trashed merchant business info permanently deleted");
+        }
+
+        @Test
+        @DisplayName("should fail when no trashed business info")
+        void deleteAll_NoTrashed() {
+            when(merchantBusinessCommandRepository.deleteAllDeleted()).thenReturn(Uni.createFrom().item(false));
+            assertThatThrownBy(() -> service.deleteAllMerchantBusinessPermanent().await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("No trashed merchant business info found");
+        }
+    }
+}

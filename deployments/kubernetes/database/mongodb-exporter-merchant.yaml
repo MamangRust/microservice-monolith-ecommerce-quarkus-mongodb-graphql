@@ -1,0 +1,51 @@
+# MongoDB metrics exporter for the merchant context (Prometheus scrapes :9216).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-exporter-merchant
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb-exporter-merchant
+  template:
+    metadata:
+      labels:
+        app: mongodb-exporter-merchant
+        tier: mongodb-exporter
+    spec:
+      containers:
+        - name: mongodb-exporter
+          image: percona/mongodb_exporter:0.42
+          imagePullPolicy: IfNotPresent
+          args: ["--mongodb.uri=mongodb://mongo-merchant.ecommerce.svc.cluster.local:27017"]
+          ports:
+            - name: metrics
+              containerPort: 9216
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9216
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-exporter-merchant
+  namespace: ecommerce
+spec:
+  selector:
+    app: mongodb-exporter-merchant
+  ports:
+    - name: metrics
+      port: 9216
+      targetPort: 9216

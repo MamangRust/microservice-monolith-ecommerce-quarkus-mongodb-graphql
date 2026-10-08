@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+# MongoDB (database-per-bounded-context, no proxy)
+- mongo-identity.yaml
+- mongo-merchant.yaml
+- mongo-catalog.yaml
+- mongo-sales.yaml
+- mongo-experience.yaml
+- mongo-email.yaml
+- mongo-network-policy.yaml
+# mongodb-exporter
+- mongodb-exporter-identity.yaml
+- mongodb-exporter-merchant.yaml
+- mongodb-exporter-catalog.yaml
+- mongodb-exporter-sales.yaml
+- mongodb-exporter-experience.yaml
+- mongodb-exporter-email.yaml
+- mongodb-exporter-network-policy.yaml
+# ClickHouse (analytics)
+- clickhouse-pvc.yaml
+- clickhouse-deployment.yaml
+- clickhouse-service.yaml
+- clickhouse-network-policy.yaml
