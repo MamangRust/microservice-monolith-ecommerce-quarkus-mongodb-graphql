@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -52,6 +54,7 @@ import com.sanedge.transaction.service.KafkaService;
 
 import io.opentelemetry.api.common.Attributes;
 import io.smallrye.mutiny.Uni;
+import io.vertx.core.json.JsonObject;
 
 @ExtendWith(MockitoExtension.class)
 class TransactionCommandServiceImplTest {
@@ -240,6 +243,39 @@ class TransactionCommandServiceImplTest {
                         assertThat(response.data().getId()).isEqualTo(TX_ID_HEX);
 
                         verify(redisService, atLeastOnce()).deleteReactive(anyString());
+                }
+
+                @Test
+                @DisplayName("should publish the transaction stats event to the transactions.event topic")
+                void create_PublishesStatsEvent() {
+                        CreateTransactionRequest req = createValidCreateRequest();
+                        mockCreateDependencies();
+
+                        when(transactionCommandRepo.persist(any(Transaction.class)))
+                                        .thenAnswer(inv -> {
+                                                Transaction t = inv.getArgument(0);
+                                                t.id = new ObjectId(TX_ID_HEX);
+                                                return Uni.createFrom().item(t);
+                                        });
+
+                        service.create(req).await().indefinitely();
+
+                        // The email event is offloaded to the same outbox, so select the stats row.
+                        ArgumentCaptor<TransactionOutbox> captor = ArgumentCaptor.forClass(TransactionOutbox.class);
+                        verify(transactionOutboxRepository, atLeastOnce()).persist(captor.capture());
+
+                        TransactionOutbox queued = captor.getAllValues().stream()
+                                        .filter(e -> "transactions.event".equals(e.getTopic()))
+                                        .findFirst()
+                                        .orElseThrow();
+                        assertThat(queued.getTopic()).isEqualTo("transactions.event");
+                        assertThat(queued.getEventKey()).isEqualTo(ORDER_ID_HEX);
+                        assertThat(queued.getEventId()).isNotBlank();
+                        // Payload is stored already enveloped — the publisher sends it verbatim.
+                        JsonObject envelope = new JsonObject(queued.getPayload());
+                        assertThat(envelope.getString("event_id")).isEqualTo(queued.getEventId());
+                        assertThat(envelope.getString("event_type")).isEqualTo("transactions.event");
+                        assertThat(envelope.getJsonObject("payload").getString("order_id")).isEqualTo(ORDER_ID_HEX);
                 }
         }
 

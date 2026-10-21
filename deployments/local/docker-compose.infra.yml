@@ -217,6 +217,36 @@ services:
       retries: 5
       start_period: 30s
 
+  # One-shot: create the stats topics the Go producers publish to and
+  # stats_writer consumes (must match StatsWriterConsumer's subscribe set).
+  kafka-topic-init:
+    image: apache/kafka:latest
+    container_name: kafka-topic-init-ecommerce
+    networks:
+      - app_ecommerce_network
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "Creating stats Kafka topics..."
+        for topic in \
+          stats.ecommerce.transaction.event \
+          stats.ecommerce.order.event \
+          stats.ecommerce.order_item.event; do
+          /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server kafka:19092 \
+            --create \
+            --if-not-exists \
+            --replication-factor 1 \
+            --partitions 1 \
+            --topic "$$topic"
+        done
+        echo "All stats topics created (or already exist)."
+    restart: "no"
+
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.9.0
     container_name: kafka-exporter_ecommerce

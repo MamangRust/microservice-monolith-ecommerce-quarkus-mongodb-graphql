@@ -26,6 +26,13 @@ import jakarta.inject.Inject;
 public class StatsWriterConsumer {
     private static final Logger log = LoggerFactory.getLogger(StatsWriterConsumer.class);
 
+    /** Transaction stats topic — produced by TransactionCommandServiceImpl. */
+    public static final String TRANSACTION_TOPIC = "transactions.event";
+    /** Order stats topic — produced by OrderCommandServiceImpl#create. */
+    public static final String ORDER_TOPIC = "order.event";
+    /** Order item stats topic — produced by OrderCommandServiceImpl#create. */
+    public static final String ORDER_ITEM_TOPIC = "order_item.event";
+
     @Inject Vertx vertx;
     @Inject ClickHouseClient clickhouse;
     @Inject StatsWriterMetrics metrics;
@@ -47,15 +54,12 @@ public class StatsWriterConsumer {
                 "key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer",
                 "value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         consumer = KafkaConsumer.create(vertx, config);
-        consumer.subscribe(Set.of(
-                "stats.ecommerce.transaction.event",
-                "stats.ecommerce.order.event",
-                "stats.ecommerce.order_item.event"))
+        consumer.subscribe(Set.of(TRANSACTION_TOPIC, ORDER_TOPIC, ORDER_ITEM_TOPIC))
                 .onSuccess(v -> log.info("Subscribed to stats topics"))
                 .onFailure(e -> log.error("Subscribe failed: {}", e.getMessage()));
         // Use handler() not recordHandler() — Vert.x 4.x API
         consumer.handler(record -> {
-            try { processEvent(record.value()); }
+            try { processEvent(record.topic(), record.value()); }
             catch (Exception e) { log.error("Process failed: {}", e.getMessage()); }
         });
         log.info("StatsWriterConsumer initialized. brokers={} group={}", bootstrapServers, groupId);
@@ -63,7 +67,7 @@ public class StatsWriterConsumer {
 
     @PreDestroy void destroy() { if (consumer != null) consumer.close(); }
 
-    private void processEvent(String message) {
+    private void processEvent(String topic, String message) {
         JsonObject json = new JsonObject(message);
         JsonObject payload = json.getJsonObject("payload", json);
         String eventType = json.getString("event_type", "");
@@ -72,29 +76,61 @@ public class StatsWriterConsumer {
         eventsConsumed.incrementAndGet();
         metrics.recordEventConsumed();
 
-        if (eventType.contains("order_item")) {
+        String kind = resolveKind(topic, eventType);
+        if ("order_item".equals(kind)) {
             orderItemBatch.add(String.join("\t", eventId, occurredAt != null ? occurredAt : "",
-                    String.valueOf(payload.getLong("order_item_id", 0L)), String.valueOf(payload.getLong("order_id", 0L)),
-                    String.valueOf(payload.getLong("merchant_id", 0L)), String.valueOf(payload.getLong("category_id", 0L)),
-                    String.valueOf(payload.getLong("product_id", 0L)), String.valueOf(payload.getInteger("quantity", 0)),
+                    id(payload, "order_item_id"), id(payload, "order_id"), id(payload, "merchant_id"),
+                    id(payload, "category_id"), id(payload, "product_id"),
+                    String.valueOf(payload.getInteger("quantity", 0)),
                     String.valueOf(payload.getDouble("unit_price", 0.0)), String.valueOf(payload.getDouble("subtotal", 0.0)),
                     String.valueOf(System.currentTimeMillis())));
-        } else if (eventType.contains("order")) {
+        } else if ("order".equals(kind)) {
             orderBatch.add(String.join("\t", eventId, occurredAt != null ? occurredAt : "",
-                    String.valueOf(payload.getLong("order_id", 0L)), String.valueOf(payload.getLong("merchant_id", 0L)),
+                    id(payload, "order_id"), id(payload, "merchant_id"),
                     payload.getString("status", ""), String.valueOf(payload.getDouble("total_amount", 0.0)),
                     String.valueOf(System.currentTimeMillis())));
-        } else if (eventType.contains("transaction")) {
+        } else if ("transaction".equals(kind)) {
             transactionBatch.add(String.join("\t", eventId, occurredAt != null ? occurredAt : "",
-                    String.valueOf(payload.getLong("transaction_id", 0L)), String.valueOf(payload.getLong("order_id", 0L)),
-                    String.valueOf(payload.getLong("merchant_id", 0L)), payload.getString("payment_method", ""),
-                    payload.getString("status", ""), String.valueOf(payload.getDouble("amount", 0.0)),
+                    id(payload, "transaction_id"), id(payload, "order_id"), id(payload, "merchant_id"),
+                    payload.getString("payment_method", ""), payload.getString("status", ""),
+                    String.valueOf(payload.getDouble("amount", 0.0)),
                     String.valueOf(System.currentTimeMillis())));
+        } else {
+            log.warn("Unrecognized stats event, skipping | topic={} event_type={}", topic, eventType);
         }
 
         if (orderBatch.size() + orderItemBatch.size() + transactionBatch.size() >= maxBatchSize) {
             flush().subscribe().with(v -> {}, e -> log.error("Auto-flush failed: {}", e.getMessage()));
         }
+    }
+
+    /**
+     * Resolves the stats table the event belongs to. The Kafka topic is the
+     * contract ({@code order_item.event}, {@code order.event},
+     * {@code transactions.event}); the {@code event_type} field is only used as
+     * a fallback.
+     */
+    private static String resolveKind(String topic, String eventType) {
+        if (ORDER_ITEM_TOPIC.equals(topic)) return "order_item";
+        if (ORDER_TOPIC.equals(topic)) return "order";
+        if (TRANSACTION_TOPIC.equals(topic)) return "transaction";
+
+        String type = eventType != null ? eventType.toLowerCase() : "";
+        if (type.contains("order_item")) return "order_item";
+        if (type.contains("order")) return "order";
+        if (type.contains("transaction")) return "transaction";
+        return "unknown";
+    }
+
+    /**
+     * Reads an identifier as text. Identifiers are hex strings in the MongoDB
+     * backed services but may also arrive as numbers, so both are accepted.
+     */
+    private static String id(JsonObject payload, String key) {
+        Object value = payload.getValue(key);
+        if (value == null) return "";
+        if (value instanceof Number) return String.valueOf(((Number) value).longValue());
+        return String.valueOf(value);
     }
 
     public Uni<Void> flush() {

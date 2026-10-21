@@ -10,11 +10,36 @@ import io.quarkus.mongodb.panache.reactive.ReactivePanacheMongoRepository;
 import io.quarkus.panache.common.Sort;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
+import org.bson.types.ObjectId;
 
 @ApplicationScoped
 public class OrderOutboxRepository implements ReactivePanacheMongoRepository<OrderOutbox> {
 
     private static final long LEASE_SECONDS = 300;
+
+    /**
+     * Persists a batch of stats events. The single-document {@code persist}
+     * inherited from Panache would need one round trip per event; a single
+     * {@code insertMany} keeps an order creation (1 order + N items) cheap.
+     */
+    public Uni<Void> persistPending(java.util.List<OrderOutbox> events) {
+        if (events == null || events.isEmpty()) {
+            return Uni.createFrom().voidItem();
+        }
+        // BaseModel#onCreate is not a Panache lifecycle callback (it is never
+        // invoked) and reads of findDue order by createdAt, so stamp it here.
+        Instant now = Instant.now();
+        for (OrderOutbox event : events) {
+            if (event.id == null) {
+                event.id = new ObjectId();
+            }
+            if (event.getCreatedAt() == null) {
+                event.setCreatedAt(now);
+                event.setUpdatedAt(now);
+            }
+        }
+        return persist(events).replaceWithVoid();
+    }
 
     public Uni<Long> countPending() {
         return count("{ 'status': 'PENDING' }");

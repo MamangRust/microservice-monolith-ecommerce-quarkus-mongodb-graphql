@@ -8,11 +8,14 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.order.entity.OrderOutbox;
 import com.sanedge.order.repository.OrderOutboxRepository;
+import io.quarkus.runtime.StartupEvent;
 import io.quarkus.scheduler.Scheduled;
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.json.JsonObject;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,8 +27,20 @@ public class OrderOutboxPublisher {
     @Inject KafkaService kafkaService;
     @Inject TracingMetrics tracingMetrics;
 
+    @ConfigProperty(name = "order.outbox.batch-size", defaultValue = "50")
+    int batchSize;
+
     private final AtomicBoolean polling = new AtomicBoolean();
     private final AtomicLong backlog = new AtomicLong(0);
+
+    void onStart(@Observes StartupEvent event) {
+        if (tracingMetrics != null) {
+            // The gauge supplier runs on the OpenTelemetry metric thread, which has
+            // no duplicated Vert.x context; read the cached counter refreshed by the
+            // scheduled poller instead of issuing a reactive Panache query there.
+            tracingMetrics.registerOutboxBacklogGauge("order", backlog::get);
+        }
+    }
 
     @Scheduled(every = "1s", delay = 5, delayUnit = TimeUnit.SECONDS)
     Uni<Void> poll() {
@@ -38,7 +53,7 @@ public class OrderOutboxPublisher {
     }
 
     private Uni<Void> publishDue() {
-        return repository.findDue(50).chain(this::publishSequentially);
+        return repository.findDue(Math.max(1, batchSize)).chain(this::publishSequentially);
     }
 
     private Uni<Void> publishSequentially(List<OrderOutbox> events) {

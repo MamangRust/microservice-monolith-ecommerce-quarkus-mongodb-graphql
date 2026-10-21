@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -50,11 +52,14 @@ import com.sanedge.order.domain.requests.UpdateOrderRequest;
 import com.sanedge.order.domain.response.OrderResponse;
 import com.sanedge.order.domain.response.OrderResponseDeleteAt;
 import com.sanedge.order.entity.Order;
+import com.sanedge.order.entity.OrderOutbox;
 import com.sanedge.order.repository.OrderCommandRepository;
+import com.sanedge.order.repository.OrderOutboxRepository;
 import com.sanedge.order.repository.OrderQueryRepository;
 
 import io.opentelemetry.api.common.Attributes;
 import io.smallrye.mutiny.Uni;
+import io.vertx.core.json.JsonObject;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validator;
 
@@ -100,6 +105,9 @@ class OrderCommandServiceImplTest {
         @Mock
         private ShippingAddressPort shippingAddressPort;
 
+        @Mock
+        private OrderOutboxRepository orderOutboxRepository;
+
         private OrderCommandServiceImpl service;
 
         @BeforeEach
@@ -117,6 +125,7 @@ class OrderCommandServiceImplTest {
                 service.orderItemPort = orderItemPort;
                 service.transactionPort = transactionPort;
                 service.shippingAddressPort = shippingAddressPort;
+                service.orderOutboxRepository = orderOutboxRepository;
 
                 lenient().doAnswer(invocation -> {
                         Supplier<Uni<?>> supplier = invocation.getArgument(2);
@@ -148,6 +157,10 @@ class OrderCommandServiceImplTest {
                                 .thenReturn(Uni.createFrom().item(Collections.emptyList()));
                 lenient().when(transactionPort.findByOrderId(anyString()))
                                 .thenReturn(Uni.createFrom().nullItem());
+
+                // Stats events are queued in the outbox on create.
+                lenient().when(orderOutboxRepository.persistPending(anyList()))
+                                .thenReturn(Uni.createFrom().voidItem());
         }
 
         private Order createTestOrder(ObjectId id, ObjectId merchantId, ObjectId userId, Integer totalPrice) {
@@ -253,6 +266,40 @@ class OrderCommandServiceImplTest {
                         assertThat(response.message()).isEqualTo("Order created successfully");
                         assertThat(response.data()).isNotNull();
                         assertThat(response.data().getId()).isEqualTo(ORDER_ID);
+                }
+
+                @Test
+                @DisplayName("should publish order and order item stats events to their kafka topics")
+                void createOrder_PublishesStatsEvents() {
+                        CreateOrderRequest request = createValidCreateOrderRequest();
+                        mockMerchantAndUser();
+                        mockProductAndOrderItem();
+                        mockShipping();
+                        mockPersistNew();
+                        when(orderItemPort.findOrderItemByOrder(anyString()))
+                                        .thenReturn(Uni.createFrom().item(List.of(
+                                                        new OrderItem("oi-1", ORDER_ID, "1", 2, 100,
+                                                                        Instant.now(), Instant.now()))));
+
+                        service.create(request).await().indefinitely();
+
+                        @SuppressWarnings("unchecked")
+                        ArgumentCaptor<List<OrderOutbox>> captor = ArgumentCaptor.forClass(List.class);
+                        verify(orderOutboxRepository).persistPending(captor.capture());
+
+                        List<OrderOutbox> queued = captor.getValue();
+                        assertThat(queued).hasSize(2);
+                        assertThat(queued).extracting(OrderOutbox::getTopic)
+                                        .containsExactlyInAnyOrder("order.event", "order_item.event");
+                        assertThat(queued).extracting(OrderOutbox::getEventKey)
+                                        .containsExactlyInAnyOrder(ORDER_ID, "oi-1");
+                        // Payload is stored already enveloped — the publisher sends it verbatim.
+                        for (OrderOutbox event : queued) {
+                                JsonObject envelope = new JsonObject(event.getPayload());
+                                assertThat(envelope.getString("event_id")).isEqualTo(event.getEventId());
+                                assertThat(envelope.getString("event_type")).isEqualTo(event.getTopic());
+                                assertThat(envelope.containsKey("payload")).isTrue();
+                        }
                 }
 
                 @Test

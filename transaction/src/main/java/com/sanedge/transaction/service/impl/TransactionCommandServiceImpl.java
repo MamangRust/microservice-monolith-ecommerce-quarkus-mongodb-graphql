@@ -46,6 +46,9 @@ import jakarta.inject.Inject;
 public class TransactionCommandServiceImpl implements TransactionCommandService {
     private static final Logger logger = LoggerFactory.getLogger(TransactionCommandServiceImpl.class);
 
+    /** Kafka topic carrying the transaction stats event (consumed by stats-writer). */
+    static final String TRANSACTION_STATS_TOPIC = "transactions.event";
+
     private final TransactionQueryRepository transactionQueryRepository;
     private final TransactionCommandRepository transactionCommandRepository;
     private final RedisService redisService;
@@ -172,7 +175,9 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                                         transaction.setUpdatedAt(now);
 
                                         return transactionCommandRepository.persist(transaction)
-                                                .chain(saved -> sendTransactionEmail(saved, order).replaceWith(saved));
+                                                .chain(saved -> sendTransactionEmail(saved, order).replaceWith(saved))
+                                                .chain(saved -> sendTransactionStats(saved)
+                                                        .replaceWith(saved));
                                     });
                         })
                         .chain(saved -> {
@@ -447,5 +452,29 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                 .onFailure().invoke(err -> logger.error("Failed to send transaction email", err))
                 .replaceWithVoid()
                 .onFailure().recoverWithItem((Void) null);
+    }
+
+
+    Uni<Void> sendTransactionStats(Transaction tx) {
+        String eventId = UUID.randomUUID().toString();
+        JsonObject payload = new JsonObject()
+                .put("transaction_id", tx.id != null ? tx.id.toHexString() : null)
+                .put("order_id", tx.getOrderId() != null ? tx.getOrderId().toHexString() : null)
+                .put("merchant_id", tx.getMerchantId() != null ? tx.getMerchantId().toHexString() : null)
+                .put("payment_method", tx.getPaymentMethod())
+                .put("status", tx.getStatus() != null ? tx.getStatus().name() : null)
+                .put("amount", tx.getAmount() != null ? tx.getAmount().doubleValue() : 0.0);
+        JsonObject event = new JsonObject()
+                .put("event_id", eventId)
+                .put("event_type", TRANSACTION_STATS_TOPIC)
+                .put("occurred_at", Instant.now().toString())
+                .put("payload", payload);
+
+        TransactionOutbox outbox = new TransactionOutbox();
+        outbox.setEventId(eventId);
+        outbox.setTopic(TRANSACTION_STATS_TOPIC);
+        outbox.setEventKey(tx.getOrderId() != null ? tx.getOrderId().toHexString() : String.valueOf(tx.id));
+        outbox.setPayload(event.encode());
+        return transactionOutboxRepository.persist(outbox).replaceWithVoid();
     }
 }

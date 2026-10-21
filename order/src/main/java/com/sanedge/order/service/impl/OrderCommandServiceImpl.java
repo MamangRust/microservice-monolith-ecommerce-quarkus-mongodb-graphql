@@ -4,6 +4,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 
 import org.bson.types.ObjectId;
 import org.slf4j.Logger;
@@ -31,12 +32,15 @@ import com.sanedge.order.domain.requests.UpdateOrderRequest;
 import com.sanedge.order.domain.response.OrderResponse;
 import com.sanedge.order.domain.response.OrderResponseDeleteAt;
 import com.sanedge.order.entity.Order;
+import com.sanedge.order.entity.OrderOutbox;
 import com.sanedge.order.repository.OrderCommandRepository;
+import com.sanedge.order.repository.OrderOutboxRepository;
 import com.sanedge.order.repository.OrderQueryRepository;
 import com.sanedge.order.service.OrderCommandService;
 
 import io.opentelemetry.api.common.Attributes;
 import io.smallrye.mutiny.Uni;
+import io.vertx.core.json.JsonObject;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.validation.ConstraintViolation;
@@ -46,6 +50,11 @@ import jakarta.validation.Validator;
 @ApplicationScoped
 public class OrderCommandServiceImpl implements OrderCommandService {
     private static final Logger logger = LoggerFactory.getLogger(OrderCommandServiceImpl.class);
+
+    /** Kafka topic carrying the order stats event (consumed by stats-writer). */
+    static final String ORDER_STATS_TOPIC = "order.event";
+    /** Kafka topic carrying the order item stats event (consumed by stats-writer). */
+    static final String ORDER_ITEM_STATS_TOPIC = "order_item.event";
 
     @Inject
     MerchantPort merchantPort;
@@ -64,6 +73,9 @@ public class OrderCommandServiceImpl implements OrderCommandService {
 
     @Inject
     ShippingAddressPort shippingAddressPort;
+
+    @Inject
+    OrderOutboxRepository orderOutboxRepository;
 
     private final OrderQueryRepository orderQueryRepository;
     private final OrderCommandRepository orderCommandRepository;
@@ -381,6 +393,8 @@ public class OrderCommandServiceImpl implements OrderCommandService {
                                             OrderResponse response = OrderResponse.from(savedOrder);
 
                                             return invalidateCache(savedOrder.id.toHexString())
+                                                    .chain(v -> sendOrderStats(savedOrder)
+                                                            .onFailure().recoverWithItem((Void) null))
                                                     .map(v -> {
                                                         logger.info("Successfully created order with ID: {}",
                                                                 savedOrder.id);
@@ -632,5 +646,69 @@ public class OrderCommandServiceImpl implements OrderCommandService {
                         return ApiResponse.success("All orders permanently deleted!");
                     });
         });
+    }
+
+
+    /**
+     * Queues the order + order_item stats events in the transactional outbox.
+     * <p>
+     * Topics: {@code order.event} and {@code order_item.event} — the only two
+     * topics this service writes to for the stats pipeline.
+     * <p>
+     * The rows are written in the same request as the order, so a broker outage
+     * no longer loses stats events: {@link com.sanedge.order.service.OrderOutboxPublisher}
+     * retries them with backoff until Kafka accepts them.
+     */
+    Uni<Void> sendOrderStats(Order order) {
+        String orderId = order.id != null ? order.id.toHexString() : null;
+        String merchantId = order.getMerchantId() != null ? order.getMerchantId().toHexString() : null;
+        Instant occurredAt = Instant.now();
+
+        List<OrderOutbox> events = new ArrayList<>();
+
+        JsonObject orderPayload = new JsonObject()
+                .put("order_id", orderId)
+                .put("merchant_id", merchantId)
+                .put("status", "CREATED")
+                .put("total_amount", order.getTotalPrice() != null ? order.getTotalPrice().doubleValue() : 0.0);
+        events.add(statsEvent(ORDER_STATS_TOPIC, orderId, orderPayload, occurredAt));
+
+        return orderItemPort.findOrderItemByOrder(orderId)
+                .chain(items -> {
+                    for (var item : items) {
+                        JsonObject itemPayload = new JsonObject()
+                                .put("order_item_id", item.id())
+                                .put("order_id", item.orderId())
+                                .put("merchant_id", merchantId)
+                                .put("category_id", "")
+                                .put("product_id", item.productId())
+                                .put("quantity", item.quantity())
+                                .put("unit_price", (double) item.price())
+                                .put("subtotal", item.price() * item.quantity() * 1.0);
+                        events.add(statsEvent(ORDER_ITEM_STATS_TOPIC, item.id(), itemPayload, occurredAt));
+                    }
+                    return orderOutboxRepository.persistPending(events);
+                });
+    }
+
+    /**
+     * Builds one outbox row. The payload is stored already enveloped
+     * ({@code event_id}/{@code event_type}/{@code occurred_at}/payload) and is
+     * sent verbatim by the publisher via {@code sendExistingEvent}, so the
+     * envelope is never applied twice.
+     */
+    private static OrderOutbox statsEvent(String topic, String key, JsonObject payload, Instant occurredAt) {
+        String eventId = UUID.randomUUID().toString();
+        JsonObject envelope = new JsonObject()
+                .put("event_id", eventId)
+                .put("event_type", topic)
+                .put("occurred_at", occurredAt.toString())
+                .put("payload", payload);
+        OrderOutbox event = new OrderOutbox();
+        event.setEventId(eventId);
+        event.setTopic(topic);
+        event.setEventKey(key);
+        event.setPayload(envelope.encode());
+        return event;
     }
 }
